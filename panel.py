@@ -116,7 +116,7 @@ th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line)}th{col
 <div class="grid">
  <div class="card"><div class="k">Posição</div><div class="v" id="pos">…</div><div class="s" id="pos2"></div></div>
  <div class="card"><div class="k">Preço BTC</div><div class="v" id="price">…</div><div class="s" id="price2"></div></div>
- <div class="card"><div class="k">Patrimônio simulado</div><div class="v" id="eq">…</div><div class="s" id="eq2"></div></div>
+ <div class="card"><div class="k" id="eqk">Patrimônio simulado</div><div class="v" id="eq">…</div><div class="s" id="eq2"></div></div>
  <div class="card"><div class="k">Comprar e segurar</div><div class="v" id="bh">…</div><div class="s" id="bh2"></div></div>
 </div>
 <div class="grid">
@@ -138,7 +138,7 @@ async function load(){
  try{
   const [st,eq,tr]=await Promise.all([j('api/status'),j('api/equity'),j('api/trades')]);
   const c=st.config,s=st.state;
-  $('mode').textContent=c.live?'REAL':'SIMULAÇÃO';$('mode').className='tag '+(c.live?'real':'sim');
+  $('mode').textContent=c.live?'REAL':'SIMULAÇÃO';$('mode').className='tag '+(c.live?'real':'sim');$('eqk').textContent=c.live?'Patrimônio do bot (real)':'Patrimônio simulado';
   $('cfg').textContent=`${c.product} · ${c.tf} · EMA ${c.fast}/${c.slow}${c.trend?' · filtro '+c.trend:''}`;
   $('upd').textContent='atualizado '+new Date().toLocaleTimeString('pt-BR');
   $('pos').textContent=s.position?'Comprado em BTC':'Fora (USDC)';

@@ -60,9 +60,23 @@ def notify(msg: str):
 
 def load_state():
     if STATE_F.exists():
-        return json.loads(STATE_F.read_text())
-    return {"usdc": float(env("PAPER_CAPITAL", 1000)), "btc": 0.0, "position": 0,
-            "last_candle": None, "start_equity": float(env("PAPER_CAPITAL", 1000))}
+        s = json.loads(STATE_F.read_text())
+        mode = s.get("mode", "paper")
+        if mode != ("live" if LIVE else "paper"):
+            sys.exit(f"O state.json é do modo '{mode}' e o bot está em '{'live' if LIVE else 'paper'}'. "
+                     f"Apague {STATE_F} antes de trocar de modo (evita herdar posição errada).")
+        return s
+    if LIVE:
+        _, usdc = _live_balances(_client())
+        cap = min(usdc, LIVE_MAX_USDC)
+        if cap < 5:
+            sys.exit(f"Modo real: USDC disponível ({usdc:.2f}) ou LIVE_MAX_USDC baixo demais.")
+        log.info("Modo real: o bot vai controlar %.2f USDC (saldo %.2f, teto %.2f)", cap, usdc, LIVE_MAX_USDC)
+        return {"mode": "live", "usdc": cap, "btc": 0.0, "position": 0,
+                "last_candle": None, "start_equity": cap}
+    cap = float(env("PAPER_CAPITAL", 1000))
+    return {"mode": "paper", "usdc": cap, "btc": 0.0, "position": 0,
+            "last_candle": None, "start_equity": cap}
 
 
 def save_state(s):
@@ -87,32 +101,71 @@ def spot_price() -> float:
 
 
 # ---------- execução ----------
+# No modo real o bot só mexe no que ELE comprou: s["usdc"] e s["btc"] são a "subconta" do bot.
+# O resto do saldo da conta nunca é vendido nem usado.
 def _client():
     from coinbase.rest import RESTClient
     return RESTClient(api_key=env("COINBASE_API_KEY"), api_secret=env("COINBASE_API_SECRET"))
 
 
+def _d(x) -> dict:
+    return x.to_dict() if hasattr(x, "to_dict") else dict(x or {})
+
+
 def _live_balances(c):
     base, quote = PRODUCT.split("-")
     bal = {base: 0.0, quote: 0.0}
-    for a in c.get_accounts(limit=250)["accounts"]:
-        if a["currency"] in bal:
-            bal[a["currency"]] = float(a["available_balance"]["value"])
+    for a in _d(c.get_accounts(limit=250)).get("accounts", []):
+        a = _d(a)
+        if a.get("currency") in bal:
+            bal[a["currency"]] = float(_d(a["available_balance"])["value"])
     return bal[base], bal[quote]
 
 
-def buy(s, price):
+def _order_id(candle: str, side: str) -> str:
+    # Mesmo id para o mesmo candle/lado: se o ciclo der erro e repetir, a Coinbase não duplica a ordem.
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"btcbot/{PRODUCT}/{candle}/{side}"))
+
+
+def _wait_fill(c, resp) -> dict:
+    r = _d(resp)
+    if not r.get("success"):
+        raise RuntimeError(f"ordem recusada: {r.get('error_response') or r.get('failure_reason') or r}")
+    oid = r.get("order_id") or _d(r.get("success_response")).get("order_id")
+    for _ in range(30):
+        o = _d(_d(c.get_order(oid)).get("order"))
+        if o.get("status") in ("FILLED", "CANCELLED", "EXPIRED", "FAILED"):
+            break
+        time.sleep(1)
+    filled = float(o.get("filled_size") or 0)
+    if filled <= 0:
+        raise RuntimeError(f"ordem {oid} sem execução (status {o.get('status')})")
+    return {"id": oid, "status": o.get("status"), "base": filled,
+            "value": float(o.get("filled_value") or 0), "fees": float(o.get("total_fees") or 0),
+            "avg": float(o.get("average_filled_price") or 0)}
+
+
+def _floor8(x: float) -> str:
+    return f"{int(x * 1e8) / 1e8:.8f}"
+
+
+def buy(s, price, candle=""):
     if LIVE:
         c = _client()
-        _, usdc = _live_balances(c)
-        size = min(usdc, LIVE_MAX_USDC) * 0.995  # folga para a taxa
+        _, avail = _live_balances(c)
+        size = min(s["usdc"], avail, LIVE_MAX_USDC) * 0.995  # folga para a taxa
         if size < 5:
-            notify(f"⚠️ COMPRA ignorada: USDC disponível/limite muito baixo ({size:.2f})")
+            notify(f"⚠️ COMPRA ignorada: USDC do bot/disponível/teto muito baixo ({size:.2f})")
             return
-        c.market_order_buy(client_order_id=str(uuid.uuid4()), product_id=PRODUCT,
-                           quote_size=f"{size:.2f}")
+        f = _wait_fill(c, c.market_order_buy(client_order_id=_order_id(candle, "BUY"),
+                                             product_id=PRODUCT, quote_size=f"{size:.2f}"))
+        s["usdc"] = max(0.0, s["usdc"] - f["value"] - f["fees"])
+        s["btc"] += f["base"]
         s["position"] = 1
-        notify(f"🟢 COMPRA REAL {PRODUCT}: {size:.2f} USDC a ~{price:,.2f}")
+        save_state(s)
+        notify(f"🟢 COMPRA REAL {PRODUCT}: {f['base']:.8f} BTC a {f['avg']:,.2f} "
+               f"({f['value']:.2f} USDC + taxa {f['fees']:.2f})")
+        price = f["avg"] or price
     else:
         fill = price * (1 + SLIPPAGE)
         btc = s["usdc"] * (1 - FEE) / fill
@@ -122,17 +175,26 @@ def buy(s, price):
             "live": LIVE, "usdc": s["usdc"], "btc": s["btc"]})
 
 
-def sell(s, price):
+def sell(s, price, candle=""):
     if LIVE:
         c = _client()
-        btc, _ = _live_balances(c)
-        if btc * price < 5:
-            s["position"] = 0
+        avail, _ = _live_balances(c)
+        qty = min(s["btc"], avail)  # nunca vende mais do que o bot comprou
+        if qty * price < 5:
+            notify(f"⚠️ VENDA ignorada: BTC do bot muito pequeno ({qty:.8f}). Posição zerada.")
+            s.update(btc=0.0, position=0)
             return
-        c.market_order_sell(client_order_id=str(uuid.uuid4()), product_id=PRODUCT,
-                            base_size=f"{btc:.8f}")
+        f = _wait_fill(c, c.market_order_sell(client_order_id=_order_id(candle, "SELL"),
+                                              product_id=PRODUCT, base_size=_floor8(qty)))
+        s["btc"] = max(0.0, s["btc"] - f["base"])
+        if s["btc"] * price < 1:  # sobra de arredondamento
+            s["btc"] = 0.0
+        s["usdc"] += f["value"] - f["fees"]
         s["position"] = 0
-        notify(f"🔴 VENDA REAL {PRODUCT}: {btc:.8f} BTC a ~{price:,.2f}")
+        save_state(s)
+        notify(f"🔴 VENDA REAL {PRODUCT}: {f['base']:.8f} BTC a {f['avg']:,.2f} "
+               f"→ {f['value'] - f['fees']:.2f} USDC (taxa {f['fees']:.2f})")
+        price = f["avg"] or price
     else:
         fill = price * (1 - SLIPPAGE)
         usdc = s["btc"] * fill * (1 - FEE)
@@ -155,9 +217,9 @@ def tick(s):
     s.setdefault("start_price", price)  # referência do "comprar e segurar"
     s.setdefault("start_time", datetime.now(timezone.utc).isoformat())
     if want == 1 and s["position"] == 0:
-        buy(s, price)
+        buy(s, price, last)
     elif want == 0 and s["position"] == 1:
-        sell(s, price)
+        sell(s, price, last)
     s["last_candle"] = last
     eq = s["usdc"] + s["btc"] * price
     bh = s["start_equity"] * price / s["start_price"]
@@ -167,7 +229,7 @@ def tick(s):
              updated=datetime.now(timezone.utc).isoformat())
     record({"candle": last, "price": round(price, 2), "equity": round(eq, 2),
             "bh_equity": round(bh, 2), "position": s["position"]}, EQUITY_F)
-    log.info("candle %s | sinal=%d pos=%d | preço %.2f | patrimônio simulado %.2f (%+.2f%%)",
+    log.info("candle %s | sinal=%d pos=%d | preço %.2f | patrimônio do bot %.2f (%+.2f%%)",
              last, want, s["position"], price, eq, (eq / s["start_equity"] - 1) * 100)
     save_state(s)
 

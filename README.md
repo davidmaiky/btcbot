@@ -55,7 +55,9 @@ LIVE_MAX_USDC=500
 COINBASE_API_KEY=organizations/.../apiKeys/...
 COINBASE_API_SECRET=-----BEGIN EC PRIVATE KEY-----...
 ```
-Crie a chave em coinbase.com/settings/api (CDP) só com permissão **View + Trade**, **sem Transfer/Withdraw**, e restrita ao IP do seu servidor. Ao trocar de simulação para real, apague o `/data/state.json`.
+Crie a chave em coinbase.com/settings/api (CDP) só com permissão **View + Trade**, **sem Transfer/Withdraw**, e restrita ao IP do seu servidor. Ao trocar de simulação para real, apague o `/data/state.json` (o bot se recusa a ligar com o estado do outro modo).
+
+No modo real o bot trabalha com uma "subconta" própria: começa com até `LIVE_MAX_USDC` e **só vende o BTC que ele mesmo comprou**. O resto do saldo da conta não é tocado. O ideal é usar um portfólio separado na Coinbase mesmo assim.
 
 ## Limitações conhecidas
 - Spot e long-only: em mercado de baixa, o melhor que o bot faz é ficar em USDC.
