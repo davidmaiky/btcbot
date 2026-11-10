@@ -10,6 +10,8 @@ Variáveis de ambiente (todas opcionais):
   LIVE_MAX_USDC=0         teto de USDC que o bot pode usar no modo real
   STATE_DIR=/data         onde salvar estado e histórico (monte um volume no Easypanel)
   TELEGRAM_TOKEN / TELEGRAM_CHAT_ID   avisos no Telegram (opcional)
+  PANEL_PASSWORD=...      liga o painel web (usuário "admin"); sem senha, o painel fica desligado
+  PORT=8080               porta do painel
 """
 import csv
 import json
@@ -24,7 +26,7 @@ from pathlib import Path
 import requests
 
 from data_source import fetch_candles, drop_open_candle
-from strategy import Params, signals
+from strategy import Params, ema, signals
 
 FEE, SLIPPAGE = 0.001, 0.0005
 TF_SECS = {"1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "1d": 86400}
@@ -42,6 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bot")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_F, TRADES_F = STATE_DIR / "state.json", STATE_DIR / "trades.csv"
+EQUITY_F = STATE_DIR / "equity.csv"  # uma linha por candle: usado pelo painel
 
 
 def notify(msg: str):
@@ -68,9 +71,9 @@ def save_state(s):
     tmp.replace(STATE_F)
 
 
-def record(row: dict):
-    new = not TRADES_F.exists()
-    with TRADES_F.open("a", newline="") as f:
+def record(row: dict, path: Path = TRADES_F):
+    new = not path.exists()
+    with path.open("a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(row))
         if new:
             w.writeheader()
@@ -146,14 +149,24 @@ def tick(s):
     last = str(df.index[-1])
     if s["last_candle"] == last:
         return
-    want = int(signals(df["close"], P).iloc[-1])
+    close = df["close"]
+    want = int(signals(close, P).iloc[-1])
     price = spot_price()
+    s.setdefault("start_price", price)  # referência do "comprar e segurar"
+    s.setdefault("start_time", datetime.now(timezone.utc).isoformat())
     if want == 1 and s["position"] == 0:
         buy(s, price)
     elif want == 0 and s["position"] == 1:
         sell(s, price)
     s["last_candle"] = last
     eq = s["usdc"] + s["btc"] * price
+    bh = s["start_equity"] * price / s["start_price"]
+    s.update(signal=want, price=price, equity=eq, bh_equity=bh,
+             ema_fast=float(ema(close, P.fast).iloc[-1]), ema_slow=float(ema(close, P.slow).iloc[-1]),
+             ema_trend=float(ema(close, P.trend).iloc[-1]) if P.trend else None,
+             updated=datetime.now(timezone.utc).isoformat())
+    record({"candle": last, "price": round(price, 2), "equity": round(eq, 2),
+            "bh_equity": round(bh, 2), "position": s["position"]}, EQUITY_F)
     log.info("candle %s | sinal=%d pos=%d | preço %.2f | patrimônio simulado %.2f (%+.2f%%)",
              last, want, s["position"], price, eq, (eq / s["start_equity"] - 1) * 100)
     save_state(s)
@@ -171,6 +184,13 @@ def main():
     if LIVE and LIVE_MAX_USDC <= 0:
         sys.exit("Modo real exige LIVE_MAX_USDC > 0.")
     s = load_state()
+    if env("PANEL_PASSWORD"):
+        import panel
+        panel.start(STATE_DIR, int(env("PORT", 8080)), env("PANEL_PASSWORD"), spot_price,
+                    {"product": PRODUCT, "tf": TF, "fast": P.fast, "slow": P.slow,
+                     "trend": P.trend, "live": LIVE, "tf_secs": TF_SECS[TF]})
+    else:
+        log.info("Painel web desligado (defina PANEL_PASSWORD para ligar).")
     notify(f"🤖 Bot iniciado | {'REAL' if LIVE else 'SIMULAÇÃO'} | {PRODUCT} {TF} | "
            f"EMA {P.fast}/{P.slow} filtro {P.trend or '-'}")
     while True:

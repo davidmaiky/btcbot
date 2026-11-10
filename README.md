@@ -34,9 +34,17 @@ PAPER_CAPITAL=1000
 TELEGRAM_TOKEN=        # opcional
 TELEGRAM_CHAT_ID=      # opcional
 ```
-5. Não precisa de domínio nem porta (é um worker). Faça o deploy e acompanhe pelos **Logs**.
+5. Faça o deploy e acompanhe pelos **Logs**.
 
-O histórico das operações simuladas fica em `/data/trades.csv` e o patrimônio aparece no log a cada candle.
+O histórico das operações simuladas fica em `/data/trades.csv`, e o patrimônio por candle fica em `/data/equity.csv` (e no log).
+
+### Painel web (opcional)
+Mostra posição, preço, patrimônio simulado contra o "comprar e segurar", distância entre as EMAs, gráfico e operações. É só leitura: não envia ordens.
+1. Em **Environment**, adicione `PANEL_PASSWORD=uma-senha-forte`. Sem essa variável, o painel não liga.
+2. Em **Domains**, adicione um domínio apontando para a **porta 8080** do app (o Easypanel cuida do HTTPS).
+3. Faça o deploy e abra o domínio. Usuário: `admin`, senha: a que você definiu.
+
+O gráfico começa a ser preenchido a partir do primeiro candle depois da atualização.
 
 ## Passo 3 (só depois de semanas em simulação): modo real
 Exige **todas** estas variáveis. Sem qualquer uma delas, o bot aborta:
