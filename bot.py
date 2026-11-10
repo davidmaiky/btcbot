@@ -1,0 +1,189 @@
+"""Bot de tendência BTC-USDC — roda 24h.
+
+MODO PADRÃO = SIMULAÇÃO (paper). Nenhuma ordem real é enviada.
+Para operar de verdade é preciso, AO MESMO TEMPO:
+  LIVE=1, CONFIRM_LIVE=SIM_EU_ENTENDO_O_RISCO, COINBASE_API_KEY e COINBASE_API_SECRET.
+
+Variáveis de ambiente (todas opcionais):
+  PRODUCT=BTC-USDC  TF=4h  FAST=50  SLOW=150  TREND=0  (backtest 10/11/2026)
+  PAPER_CAPITAL=1000      capital simulado em USDC
+  LIVE_MAX_USDC=0         teto de USDC que o bot pode usar no modo real
+  STATE_DIR=/data         onde salvar estado e histórico (monte um volume no Easypanel)
+  TELEGRAM_TOKEN / TELEGRAM_CHAT_ID   avisos no Telegram (opcional)
+"""
+import csv
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+from data_source import fetch_candles, drop_open_candle
+from strategy import Params, signals
+
+FEE, SLIPPAGE = 0.001, 0.0005
+TF_SECS = {"1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "1d": 86400}
+
+env = os.environ.get
+PRODUCT = env("PRODUCT", "BTC-USDC")
+TF = env("TF", "4h")
+P = Params(int(env("FAST", 50)), int(env("SLOW", 150)), int(env("TREND", 0)))
+STATE_DIR = Path(env("STATE_DIR", "/data"))
+LIVE = env("LIVE") == "1" and env("CONFIRM_LIVE") == "SIM_EU_ENTENDO_O_RISCO"
+LIVE_MAX_USDC = float(env("LIVE_MAX_USDC", 0))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                    stream=sys.stdout)
+log = logging.getLogger("bot")
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_F, TRADES_F = STATE_DIR / "state.json", STATE_DIR / "trades.csv"
+
+
+def notify(msg: str):
+    log.info(msg)
+    tok, chat = env("TELEGRAM_TOKEN"), env("TELEGRAM_CHAT_ID")
+    if tok and chat:
+        try:
+            requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                          json={"chat_id": chat, "text": msg}, timeout=10)
+        except requests.RequestException as e:
+            log.warning("Telegram falhou: %s", e)
+
+
+def load_state():
+    if STATE_F.exists():
+        return json.loads(STATE_F.read_text())
+    return {"usdc": float(env("PAPER_CAPITAL", 1000)), "btc": 0.0, "position": 0,
+            "last_candle": None, "start_equity": float(env("PAPER_CAPITAL", 1000))}
+
+
+def save_state(s):
+    tmp = STATE_F.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s, indent=2))
+    tmp.replace(STATE_F)
+
+
+def record(row: dict):
+    new = not TRADES_F.exists()
+    with TRADES_F.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row))
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
+def spot_price() -> float:
+    r = requests.get(f"https://api.coinbase.com/api/v3/brokerage/market/products/{PRODUCT}", timeout=15)
+    r.raise_for_status()
+    return float(r.json()["price"])
+
+
+# ---------- execução ----------
+def _client():
+    from coinbase.rest import RESTClient
+    return RESTClient(api_key=env("COINBASE_API_KEY"), api_secret=env("COINBASE_API_SECRET"))
+
+
+def _live_balances(c):
+    base, quote = PRODUCT.split("-")
+    bal = {base: 0.0, quote: 0.0}
+    for a in c.get_accounts(limit=250)["accounts"]:
+        if a["currency"] in bal:
+            bal[a["currency"]] = float(a["available_balance"]["value"])
+    return bal[base], bal[quote]
+
+
+def buy(s, price):
+    if LIVE:
+        c = _client()
+        _, usdc = _live_balances(c)
+        size = min(usdc, LIVE_MAX_USDC) * 0.995  # folga para a taxa
+        if size < 5:
+            notify(f"⚠️ COMPRA ignorada: USDC disponível/limite muito baixo ({size:.2f})")
+            return
+        c.market_order_buy(client_order_id=str(uuid.uuid4()), product_id=PRODUCT,
+                           quote_size=f"{size:.2f}")
+        s["position"] = 1
+        notify(f"🟢 COMPRA REAL {PRODUCT}: {size:.2f} USDC a ~{price:,.2f}")
+    else:
+        fill = price * (1 + SLIPPAGE)
+        btc = s["usdc"] * (1 - FEE) / fill
+        s.update(btc=btc, usdc=0.0, position=1)
+        notify(f"🟢 [SIMULAÇÃO] COMPRA {btc:.6f} BTC a {fill:,.2f}")
+    record({"time": datetime.now(timezone.utc).isoformat(), "side": "BUY", "price": price,
+            "live": LIVE, "usdc": s["usdc"], "btc": s["btc"]})
+
+
+def sell(s, price):
+    if LIVE:
+        c = _client()
+        btc, _ = _live_balances(c)
+        if btc * price < 5:
+            s["position"] = 0
+            return
+        c.market_order_sell(client_order_id=str(uuid.uuid4()), product_id=PRODUCT,
+                            base_size=f"{btc:.8f}")
+        s["position"] = 0
+        notify(f"🔴 VENDA REAL {PRODUCT}: {btc:.8f} BTC a ~{price:,.2f}")
+    else:
+        fill = price * (1 - SLIPPAGE)
+        usdc = s["btc"] * fill * (1 - FEE)
+        s.update(usdc=usdc, btc=0.0, position=0)
+        notify(f"🔴 [SIMULAÇÃO] VENDA a {fill:,.2f} → {usdc:,.2f} USDC")
+    record({"time": datetime.now(timezone.utc).isoformat(), "side": "SELL", "price": price,
+            "live": LIVE, "usdc": s["usdc"], "btc": s["btc"]})
+
+
+# ---------- loop ----------
+def tick(s):
+    lookback_days = max(60, int(P.min_bars() * 3 * TF_SECS[TF] / 86400) + 5)
+    df = drop_open_candle(fetch_candles(PRODUCT, TF, lookback_days), TF)
+    last = str(df.index[-1])
+    if s["last_candle"] == last:
+        return
+    want = int(signals(df["close"], P).iloc[-1])
+    price = spot_price()
+    if want == 1 and s["position"] == 0:
+        buy(s, price)
+    elif want == 0 and s["position"] == 1:
+        sell(s, price)
+    s["last_candle"] = last
+    eq = s["usdc"] + s["btc"] * price
+    log.info("candle %s | sinal=%d pos=%d | preço %.2f | patrimônio simulado %.2f (%+.2f%%)",
+             last, want, s["position"], price, eq, (eq / s["start_equity"] - 1) * 100)
+    save_state(s)
+
+
+def sleep_until_next_close():
+    step = TF_SECS[TF]
+    now = time.time()
+    time.sleep(step - now % step + 90)  # 90s após o fechamento, para a API consolidar o candle
+
+
+def main():
+    if env("LIVE") == "1" and not LIVE:
+        sys.exit("LIVE=1 sem CONFIRM_LIVE=SIM_EU_ENTENDO_O_RISCO. Abortando por segurança.")
+    if LIVE and LIVE_MAX_USDC <= 0:
+        sys.exit("Modo real exige LIVE_MAX_USDC > 0.")
+    s = load_state()
+    notify(f"🤖 Bot iniciado | {'REAL' if LIVE else 'SIMULAÇÃO'} | {PRODUCT} {TF} | "
+           f"EMA {P.fast}/{P.slow} filtro {P.trend or '-'}")
+    while True:
+        try:
+            tick(s)
+        except Exception as e:  # nunca morrer silenciosamente
+            notify(f"⚠️ Erro no ciclo: {e!r}")
+            time.sleep(300)
+            continue
+        if env("RUN_ONCE") == "1":
+            break
+        sleep_until_next_close()
+
+
+if __name__ == "__main__":
+    main()
