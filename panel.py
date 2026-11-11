@@ -77,9 +77,16 @@ def start(state_dir: Path, port: int, password: str, price_fn, config: dict):
                     self._send(200, json.dumps(_read_csv(state_dir / "trades.csv", 200)), "application/json")
                 else:
                     self._send(404, "não encontrado", "text/plain; charset=utf-8")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # o navegador/proxy fechou a conexão antes da resposta (aba fechada,
+                # reload, timeout do proxy): não há a quem responder, então só ignora
+                self.close_connection = True
             except Exception as e:
-                log.warning("painel: %r", e)
-                self._send(500, "erro interno", "text/plain; charset=utf-8")
+                log.warning("painel %s: %r", path, e)
+                try:
+                    self._send(500, "erro interno", "text/plain; charset=utf-8")
+                except OSError:
+                    self.close_connection = True
 
     srv = ThreadingHTTPServer(("0.0.0.0", port), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
