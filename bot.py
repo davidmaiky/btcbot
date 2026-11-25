@@ -105,7 +105,15 @@ def spot_price() -> float:
 # O resto do saldo da conta nunca é vendido nem usado.
 def _client():
     from coinbase.rest import RESTClient
-    return RESTClient(api_key=env("COINBASE_API_KEY"), api_secret=env("COINBASE_API_SECRET"))
+    key = (env("COINBASE_API_KEY") or "").strip().strip('"\'')
+    secret = (env("COINBASE_API_SECRET") or "").strip().strip('"\'').replace("\\n", "\n")
+    if not key.startswith("organizations/"):
+        sys.exit("COINBASE_API_KEY inválida: use uma chave CDP no formato 'organizations/<org>/apiKeys/<id>' "
+                 "(chave UUID + secret base64 é do Coinbase Exchange e não funciona aqui).")
+    if "BEGIN EC PRIVATE KEY" not in secret or "\n" not in secret:
+        sys.exit("COINBASE_API_SECRET inválido: precisa ser o PEM completo '-----BEGIN EC PRIVATE KEY-----...' "
+                 "com quebras de linha (ou \\n literais).")
+    return RESTClient(api_key=key, api_secret=secret)
 
 
 def _d(x) -> dict:
