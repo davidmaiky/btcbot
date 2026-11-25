@@ -110,9 +110,16 @@ def _client():
     if not key.startswith("organizations/"):
         sys.exit("COINBASE_API_KEY inválida: use uma chave CDP no formato 'organizations/<org>/apiKeys/<id>' "
                  "(chave UUID + secret base64 é do Coinbase Exchange e não funciona aqui).")
-    if "BEGIN EC PRIVATE KEY" not in secret or "\n" not in secret:
-        sys.exit("COINBASE_API_SECRET inválido: precisa ser o PEM completo '-----BEGIN EC PRIVATE KEY-----...' "
-                 "com quebras de linha (ou \\n literais).")
+    import re
+    m = re.search(r"-----BEGIN ((?:EC )?PRIVATE KEY)-----(.+?)-----END \1-----", secret, re.S)
+    if not m:
+        sys.exit(f"COINBASE_API_SECRET inválido (começa com {secret[:12]!r}, {len(secret)} chars): "
+                 "precisa conter o PEM completo '-----BEGIN EC PRIVATE KEY-----...-----END EC PRIVATE KEY-----'. "
+                 "Não use o 'API Secret' base64 do Exchange.")
+    # Reconstrói o PEM mesmo que as quebras de linha tenham virado espaços ou sumido.
+    body = re.sub(r"\s+", "", m.group(2))
+    secret = f"-----BEGIN {m.group(1)}-----\n" + "\n".join(body[i:i + 64] for i in range(0, len(body), 64)) \
+             + f"\n-----END {m.group(1)}-----\n"
     return RESTClient(api_key=key, api_secret=secret)
 
 
